@@ -8,6 +8,11 @@ from collections import defaultdict
 from importlib import import_module
 from shutil import which
 
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from hashlib import sha256
+
 from app.utility.base_service import BaseService
 
 default_flag_params = ('server', 'group', 'listenP2P', 'c2', 'includeProxyPeers')
@@ -41,7 +46,44 @@ class SandService(BaseService):
                                           output_name=name,
                                           extension_names=extension_names,
                                           compile_target_dir='gocat')
-        return await self.app_svc.retrieve_compiled_file(name, platform)
+
+        filename, display_name = await self.app_svc.retrieve_compiled_file(name, platform)
+
+        # Check if we want to do environmental keying to encrypt agent payload.
+        if headers.get('ek') and headers.get('username') and headers.get('hostname'):
+            output_filename = 'agentencrypted.dat'
+            await self.environmental_keying_encryption(
+                headers.get('username'),
+                headers.get('hostname'),
+                filename,
+                output_filename
+            )
+            filename = output_filename
+
+        return filename, display_name
+
+    async def environmental_keying_encryption(self, username, hostname, input_filename, output_filename):
+        file_path, contents = await self.file_svc.read_file(input_filename)
+
+        # Generate AES key based on first 16 bytes of SHA256 of hostname+username
+        key = sha256((hostname + username).encode('utf-8')).digest()[0:16]
+
+        # Generate random IV
+        iv = os.urandom(16)
+
+        # Encrypt the contents via AES.
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(contents) + padder.finalize()
+        backend = default_backend()
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+        # Write IV + ciphertext
+        filepath = os.path.relpath(os.path.join(self.sandcat_dir, 'payloads', output_filename))
+        with open(filepath, 'wb') as f:
+            f.write(iv)
+            f.write(ciphertext)
 
     async def dynamically_compile_library(self, headers):
         # HTTP headers will specify the file name, platform, and comma-separated list of extension modules to include.
